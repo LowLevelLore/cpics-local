@@ -1,0 +1,31 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4"
+serde = { version = "1.0", features = ["derive"] }
+dotenv = "0.15"
+
+# sqlx: enable postgres + tokio runtime + uuid support (and macros if you need them)
+sqlx = { version = "0.8.6", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "macros",
+] }
+
+bcrypt = "0.17.1"
+
+# uuid: enable v4 generator and serde support
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+
+# jsonwebtoken: keep rust_crypto (or choose aws_lc_rs per your environment)
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+chrono = "0.4.42"
+anyhow = "1.0.100"
+env_logger = "0.11.8"
+log = "0.4.28"
+serde_json = "1.0.145"
