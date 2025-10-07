@@ -1,5 +1,5 @@
 // src/main.rs
-use actix_web::{web, App, HttpServer, HttpResponse, Responder, middleware::Logger};
+use actix_web::{web, App, HttpServer, HttpResponse, Responder, middleware::Logger, HttpRequest};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions, Row};
 use dotenv::dotenv;
@@ -13,6 +13,7 @@ use anyhow::Context;
 #[derive(Debug, Serialize, Deserialize)]
 struct RegisterRequest {
     username: String,
+    email: String,
     password: String,
 }
 
@@ -59,8 +60,8 @@ fn create_jwt(sub: &str, secret: &str, exp_seconds: i64) -> Result<String, JwtEr
 }
 
 async fn register(db: web::Data<Pool<Postgres>>, req: web::Json<RegisterRequest>) -> impl Responder {
-    if req.username.trim().is_empty() || req.password.is_empty() {
-        return HttpResponse::BadRequest().body("username and password required");
+    if req.username.trim().is_empty() || req.email.trim().is_empty() || req.password.is_empty() {
+        return HttpResponse::BadRequest().body("username, email and password required");
     }
 
     let hashed = match bcrypt_hash(&req.password, 12) {
@@ -72,15 +73,16 @@ async fn register(db: web::Data<Pool<Postgres>>, req: web::Json<RegisterRequest>
     };
     let id = Uuid::new_v4();
 
-    let res = sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)")
+    let res = sqlx::query("INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)")
         .bind(id)
         .bind(&req.username)
+        .bind(&req.email)
         .bind(&hashed)
         .execute(db.get_ref())
         .await;
 
     match res {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"id": id, "username": req.username})),
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"id": id, "username": req.username, "email": req.email})),
         Err(e) => {
             log::error!("DB insert error: {}", e);
             if e.to_string().to_lowercase().contains("unique") {
@@ -178,12 +180,63 @@ async fn verify_token(req: web::Query<VerifyRequest>) -> impl Responder {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct UserInfoResponse {
+    id: String,
+    email: String,
+    username: String,
+}
+
+async fn get_info(req: HttpRequest, db: web::Data<Pool<Postgres>>) -> impl Responder {
+    let auth_header = match req.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
+        Some(h) if h.starts_with("Bearer ") => h,
+        _ => return HttpResponse::Unauthorized().body("Missing or invalid Authorization header"),
+    };
+
+    let token = &auth_header[7..]; 
+
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret".to_string());
+    let claims = match decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &Validation::default()) {
+        Ok(token_data) => token_data.claims,
+        Err(e) => {
+            log::warn!("Token validation failed in get_info: {}", e);
+            return HttpResponse::Unauthorized().body("Invalid or expired token");
+        }
+    };
+
+    let user_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return HttpResponse::BadRequest().body("Invalid user ID format in token"),
+    };
+
+    match sqlx::query("SELECT username, email FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(db.get_ref())
+        .await
+    {
+        Ok(row) => {
+            let username: String = row.try_get("username").unwrap_or_default();
+            let email: String = row.try_get("email").unwrap_or_default();
+            HttpResponse::Ok().json(UserInfoResponse { id: user_id.to_string(), email: email, username: username })
+        }
+        Err(sqlx::Error::RowNotFound) => {
+            log::error!("User ID from token {} not found in database", user_id);
+            HttpResponse::NotFound().body("User associated with token not found")
+        }
+        Err(e) => {
+            log::error!("DB error fetching user info: {}", e);
+            HttpResponse::InternalServerError().body("Database error")
+        }
+    }
+}
+
 async fn ensure_users_table(pool: &Pool<Postgres>) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL
         )
         "#
@@ -223,6 +276,7 @@ async fn main() -> std::io::Result<()> {
             .route("/login", web::post().to(login))
             .route("/refresh", web::post().to(refresh))
             .route("/verify", web::get().to(verify_token))
+            .route("/get-info", web::get().to(get_info)) 
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
